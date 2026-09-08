@@ -16,8 +16,8 @@ from .combat_backends.combat_config_parser import TargetType, TargetData, MoveCo
 from wizwalker.memory.memory_objects.conditionals import ReqHangingAura
 from .combat_backends.backend_base import BaseCombatBackend
 from .combat_backends.spell_ranking import (
-    AllOf, Amount, CardFacts, CardSource, CategoryRanker, OneOf, ScoreNode,
-    expected_value, rank_facts, ranker_for,
+    AllOf, Amount, BestOf, CardFacts, CardSource, CategoryRanker, OneOf,
+    ScoreNode, expected_value, rank_facts, ranker_for,
 )
 
 from enum import Enum, auto
@@ -488,8 +488,13 @@ async def _score_node(
     alternatives. A random-damage spell stores one effect per possible roll, so
     flattening and summing scores Humongofrog as 575+585+595+605+615.
     """
+    # How effects that land together combine: damage adds, buffs take the best,
+    # since a card's several blades go on different schools. Doubles as the
+    # empty node for a leaf that does not count.
+    lands_together = AllOf if ranker.effects_stack else BestOf
+
     if depth > 8:  # Cycle / pathological-nesting guard, as in _flatten_effect.
-        return AllOf()
+        return lands_together()
     cls = type(effect)
 
     async def recurse(sub) -> ScoreNode:
@@ -502,26 +507,26 @@ async def _score_node(
         return OneOf(tuple([await recurse(sub) for sub in await effect.effects_list()]))
 
     if issubclass(cls, CompoundSpellEffect):  # EffectList / Shadow / ShadowPact
-        return AllOf(tuple([await recurse(sub) for sub in await effect.effects_list()]))
+        return lands_together(tuple([await recurse(sub) for sub in await effect.effects_list()]))
 
     if issubclass(cls, ConditionalSpellEffect):
         return OneOf(tuple([await recurse(await el.effect()) for el in await effect.elements()]))
 
     if issubclass(cls, HangingConversionSpellEffect):
-        return AllOf(tuple([await recurse(sub) for sub in await effect.output_effect()]))
+        return lands_together(tuple([await recurse(sub) for sub in await effect.output_effect()]))
 
     # Leaf. The filter is `is_req_satisfied` itself rather than a copy of its
     # conditions, so ranking scores exactly what matching matched — including
     # the sign convention that makes a ward's param negative.
     if await is_req_satisfied(effect, ranker.score_type, template, allow_aoe) is not ReqSatisfaction.true:
-        return AllOf()
+        return lands_together()
 
     eff_type = await effect.effect_type()
     if (eff_type in flat_buff_effects) is not flat:
-        return AllOf()
+        return lands_together()
 
     if ranker.aoe_only and await effect.effect_target() not in aoe_targets:
-        return AllOf()
+        return lands_together()
 
     # `effect_param` is used as-is beyond the sign: on a live client it is the
     # *total* for a damage-over-time effect and it already includes any
@@ -535,10 +540,12 @@ async def card_facts(
     """Classify one card for `spell_ranking`."""
     allow_aoe = SpellType.type_aoe in template.requirements
     effects = await card.get_spell_effects()
+    lands_together = AllOf if ranker.effects_stack else BestOf
 
     async def tree(flat: bool) -> ScoreNode:
-        # Top-level effects all land together, so the card itself is an AllOf.
-        return AllOf(tuple([await _score_node(e, ranker, template, allow_aoe, flat) for e in effects]))
+        # The card's top-level effects all land, so they combine the same way
+        # the children of any other landing container do.
+        return lands_together(tuple([await _score_node(e, ranker, template, allow_aoe, flat) for e in effects]))
 
     # Percentage and flat modifiers both read as a bare int, so a card is
     # scored on one kind or the other and never on a sum of the two. A card

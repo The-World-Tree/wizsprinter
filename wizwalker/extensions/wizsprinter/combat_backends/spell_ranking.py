@@ -33,6 +33,9 @@ THE TWO POLICIES
     no "save the big one for later" case to model here.  The strongest is
     simply the one to cast.
 
+    What does not add up is the several blades a *single* card can apply, since
+    they go on different schools: see `BestOf`.
+
 THE TIEBREAKS, shared by both policies
     1. Lower pip cost.  The same effect for fewer pips is strictly better.
     2. Spend the card that cannot be improved or saved, in this order:
@@ -106,6 +109,24 @@ class AllOf:
 
 
 @dataclass(frozen=True)
+class BestOf:
+    """Every child lands, but only the best one counts toward the score.
+
+    A blade card that applies several blades applies them to *different*
+    schools: a sharpened Epiphany Blade puts 55% on Myth and 55% on Storm, and
+    whichever attack follows is helped by one of them, never both. Summing them
+    scores it 110 for a 55% buff, which inverts every close comparison -- a
+    plain Epiphany Blade sums to 90 and buries a sharpened Mythblade it in fact
+    ties with at 45%, and loses to on pip cost. So buff categories combine with
+    max where damage combines with sum.
+
+    Also the empty node: `BestOf(())` scores zero.
+    """
+
+    children: Tuple["ScoreNode", ...] = ()
+
+
+@dataclass(frozen=True)
 class OneOf:
     """Exactly one child lands, so the score is the mean over the branches.
 
@@ -117,7 +138,7 @@ class OneOf:
     children: Tuple["ScoreNode", ...] = ()
 
 
-ScoreNode = Union[Amount, AllOf, OneOf]
+ScoreNode = Union[Amount, AllOf, BestOf, OneOf]
 
 
 def expected_value(node: ScoreNode) -> float:
@@ -126,6 +147,8 @@ def expected_value(node: ScoreNode) -> float:
         return float(node.param)
     if isinstance(node, AllOf):
         return sum(expected_value(child) for child in node.children)
+    if isinstance(node, BestOf):
+        return max((expected_value(child) for child in node.children), default=0.0)
     if isinstance(node, OneOf):
         if not node.children:
             return 0.0
@@ -193,20 +216,30 @@ class CategoryRanker:
             scores damage, since its own predicate only asks about targeting.
         aoe_only: Score only the effects aimed at a whole team, rather than
             every effect the predicate accepts.
+        effects_stack: Whether effects that land together add up. Damage does —
+            an initial hit plus its damage-over-time tail both hurt. Buffs do
+            not: a card applying several blades applies them to different
+            schools, so only the best one helps the attack that follows. The
+            caller builds `AllOf` or `BestOf` accordingly.
         sort_key: Maps the card's facts to a key that sorts best-first.
     """
 
     score_type: SpellType
     aoe_only: bool
+    effects_stack: bool
     sort_key: SortKey
 
 
 def _damage(spell_type: SpellType, aoe_only: bool = False) -> CategoryRanker:
-    return CategoryRanker(score_type=spell_type, aoe_only=aoe_only, sort_key=damage_sort_key)
+    return CategoryRanker(
+        score_type=spell_type, aoe_only=aoe_only, effects_stack=True, sort_key=damage_sort_key
+    )
 
 
 def _buff(spell_type: SpellType) -> CategoryRanker:
-    return CategoryRanker(score_type=spell_type, aoe_only=False, sort_key=buff_sort_key)
+    return CategoryRanker(
+        score_type=spell_type, aoe_only=False, effects_stack=False, sort_key=buff_sort_key
+    )
 
 
 # One row per rankable category. A SpellType absent from here is left in the
