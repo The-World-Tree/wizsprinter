@@ -20,10 +20,13 @@ THE TWO POLICIES
     reserve as a backup hit anyway since they cast at any pip count.
 
     Buffs and debuffs (`<blade>`, `<trap>`, `<charm>`, `<ward>`, the
-    incoming/outgoing pairs, and the `<mod_*>` enchantments) rank on the
-    magnitude of the buff, descending.  Magnitude rather than signed value
-    because a ward and a charm are *defined* by a negative param: a -70 Tower
-    Shield is the stronger of two shields, not the weaker.  Flat modifiers are
+    incoming/outgoing pairs, and the `<mod_*>` enchantments) rank on sign
+    first, then on the magnitude of the buff, descending.  Magnitude rather
+    than signed value because a ward and a charm are *defined* by a negative
+    param: a -70 Tower Shield is the stronger of two shields, not the weaker.
+    Sign first because five of these categories admit both signs at once --
+    `<inc_damage>` matches a Feint and a Thermic Shield alike, and magnitude
+    alone ranked those as equals.  See `buff_sort_key`.  Flat modifiers are
     demoted the way per-pip damage is -- a +225 flat blade and a +35% blade
     both read as a bare int, so comparing them by value would hand every
     contest to the flat one.  Flat buffs are rare; percentage always wins.
@@ -89,9 +92,12 @@ class CardSource(IntEnum):
 class Amount:
     """A leaf: one param that counts toward this category's score.
 
-    Always a magnitude. Wards and charms carry a negative `effect_param` by
-    definition, and a bigger negative is a better ward, so the caller takes the
-    absolute value on the way in and this module never sees a sign.
+    Signed, as the game stores it. Most categories pin the sign themselves --
+    `is_trap()` requires a positive param and `is_ward()` a negative one -- but
+    the five that gate on `is_effect_beneficial` admit both: `<inc_damage>`
+    matches a Feint (+70 on the enemy) and a Thermic Shield (-70 on me) alike.
+    Scoring those on magnitude alone ranked them as equals, so the sign is kept
+    and `buff_sort_key` separates them before magnitude is consulted.
     """
 
     param: int
@@ -121,6 +127,10 @@ class BestOf:
     max where damage combines with sum.
 
     Also the empty node: `BestOf(())` scores zero.
+
+    "Best" is the largest *magnitude*, and its own sign comes back with it. A
+    Thermic Shield's two -70s must not resolve to the -50 a plain `max` would
+    pick off a card carrying -70 and -50.
     """
 
     children: Tuple["ScoreNode", ...] = ()
@@ -148,7 +158,7 @@ def expected_value(node: ScoreNode) -> float:
     if isinstance(node, AllOf):
         return sum(expected_value(child) for child in node.children)
     if isinstance(node, BestOf):
-        return max((expected_value(child) for child in node.children), default=0.0)
+        return max((expected_value(child) for child in node.children), key=abs, default=0.0)
     if isinstance(node, OneOf):
         if not node.children:
             return 0.0
@@ -201,9 +211,31 @@ def damage_sort_key(facts: CardFacts) -> tuple:
     return (1 if facts.is_per_pip else 0, -facts.total) + _tiebreaks(facts)
 
 
-def buff_sort_key(facts: CardFacts) -> tuple:
-    """Sort key for buff and debuff categories. Lower sorts first."""
-    return (1 if facts.is_flat else 0, -facts.total) + _tiebreaks(facts)
+def buff_sort_key(prefer_negative: bool = False) -> SortKey:
+    """Build the sort key for a buff or debuff category. Lower sorts first.
+
+    Sign is a tier of its own, ahead of magnitude, because the five categories
+    gating on `is_effect_beneficial` admit both at once: a `<inc_damage>` clause
+    matches a Feint (+70 on the enemy) and a Thermic Shield (-70 on me), and
+    those are not the same axis to rank along. Scoring on magnitude alone made
+    them equals.
+
+    Which sign leads is per-category, because these categories are named from
+    the wizard's own point of view and the sign that means "aimed at my team"
+    is not the same one throughout. `is_effect_beneficial` admits exactly one
+    ally-targeted sign per category: negative for `<inc_damage>`, where my
+    version is a shield, and positive for `<out_damage>`, where it is a blade.
+    `prefer_negative` names that sign, so both read as "mine first".
+
+    In every other category the predicate pins the sign outright, so the tier
+    is uniform and magnitude alone decides, exactly as before.
+    """
+
+    def key(facts: CardFacts) -> tuple:
+        preferred = facts.total <= 0 if prefer_negative else facts.total >= 0
+        return (1 if facts.is_flat else 0, 0 if preferred else 1, -abs(facts.total)) + _tiebreaks(facts)
+
+    return key
 
 
 @dataclass(frozen=True)
@@ -236,9 +268,12 @@ def _damage(spell_type: SpellType, aoe_only: bool = False) -> CategoryRanker:
     )
 
 
-def _buff(spell_type: SpellType) -> CategoryRanker:
+def _buff(spell_type: SpellType, prefer_negative: bool = False) -> CategoryRanker:
     return CategoryRanker(
-        score_type=spell_type, aoe_only=False, effects_stack=False, sort_key=buff_sort_key
+        score_type=spell_type,
+        aoe_only=False,
+        effects_stack=False,
+        sort_key=buff_sort_key(prefer_negative),
     )
 
 
@@ -250,11 +285,14 @@ CATEGORY_RANKERS = {
     SpellType.type_mod_damage: _buff(SpellType.type_mod_damage),
     SpellType.type_mod_heal: _buff(SpellType.type_mod_heal),
     SpellType.type_mod_pierce: _buff(SpellType.type_mod_pierce),
+    # charm and ward are pinned negative by their own predicates, so the sign
+    # tier never fires for them; it is spelled out anyway so the table reads as
+    # one rule rather than as a special case for inc_damage.
     SpellType.type_blade: _buff(SpellType.type_blade),
     SpellType.type_trap: _buff(SpellType.type_trap),
-    SpellType.type_charm: _buff(SpellType.type_charm),
-    SpellType.type_ward: _buff(SpellType.type_ward),
-    SpellType.type_inc_damage: _buff(SpellType.type_inc_damage),
+    SpellType.type_charm: _buff(SpellType.type_charm, prefer_negative=True),
+    SpellType.type_ward: _buff(SpellType.type_ward, prefer_negative=True),
+    SpellType.type_inc_damage: _buff(SpellType.type_inc_damage, prefer_negative=True),
     SpellType.type_out_damage: _buff(SpellType.type_out_damage),
     SpellType.type_inc_heal: _buff(SpellType.type_inc_heal),
     SpellType.type_out_heal: _buff(SpellType.type_out_heal),

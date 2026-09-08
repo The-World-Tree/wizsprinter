@@ -528,10 +528,12 @@ async def _score_node(
     if ranker.aoe_only and await effect.effect_target() not in aoe_targets:
         return lands_together()
 
-    # `effect_param` is used as-is beyond the sign: on a live client it is the
-    # *total* for a damage-over-time effect and it already includes any
-    # enchantment on the card, so neither needs correcting for here.
-    return Amount(abs(await effect.effect_param()))
+    # `effect_param` is used exactly as the game stores it, sign included: on a
+    # live client it is the *total* for a damage-over-time effect and it already
+    # includes any enchantment on the card, so neither needs correcting for.
+    # The sign matters because <inc_damage> and its four siblings match both a
+    # trap on the enemy and a shield on us — see `buff_sort_key`.
+    return Amount(await effect.effect_param())
 
 
 async def card_facts(
@@ -551,11 +553,13 @@ async def card_facts(
     # scored on one kind or the other and never on a sum of the two. A card
     # with any percentage effect is a percentage card; the flat pass is only
     # reached by the rare card that is flat-only.
+    # Compared against zero rather than tested for positivity: a flat ward or
+    # charm scores negative, and dropping it would leave the card at zero.
     score = await tree(flat=False)
     is_flat = False
     if expected_value(score) == 0:
         flat_score = await tree(flat=True)
-        if expected_value(flat_score) > 0:
+        if expected_value(flat_score) != 0:
             score, is_flat = flat_score, True
 
     # A card that already carries an enchant cannot receive the pending one.
