@@ -24,8 +24,8 @@ def get_sprinty_grammar():
             cond_target: cond_target_self | cond_target_boss | cond_target_enemy | cond_target_ally | cond_target_enemies | cond_target_allies
             cond_target_self: _spaced{"self"}
             cond_target_boss: _spaced{"boss"}
-            cond_target_enemy: _spaced{"enemy"} (_open_paren INT _close_paren)?
-            cond_target_ally: _spaced{"ally"} (_open_paren INT _close_paren)?
+            cond_target_enemy: _spaced{"enemy"} (_open_paren target_index _close_paren)?
+            cond_target_ally: _spaced{"ally"} (_open_paren target_index _close_paren)?
             cond_target_enemies: cond_agg _open_paren _spaced{"enemies"} _close_paren
             cond_target_allies: cond_agg _open_paren _spaced{"allies"} _close_paren
             cond_agg: cond_agg_any | cond_agg_all | cond_agg_avg
@@ -58,13 +58,17 @@ def get_sprinty_grammar():
             target_type: target_self | target_boss | target_enemy | target_enemies | target_ally | target_allies | target_aoe | target_spell | target_named
             target_self: _spaced{"self"}
             target_boss: _spaced{"boss"}
-            target_enemy: _spaced{"enemy"} (_open_paren INT _close_paren)?
+            target_enemy: _spaced{"enemy"} (_open_paren target_index _close_paren)?
             target_enemies: _spaced{"enemies"}
-            target_ally: _spaced{"ally"} (_open_paren INT _close_paren)?
+            target_ally: _spaced{"ally"} (_open_paren target_index _close_paren)?
             target_allies: _spaced{"allies"}
             target_aoe: _spaced{"aoe"}
             target_named: words | string
             target_spell: _spaced{"spell"} _open_paren (any_spell | words | string) [(_comma (any_spell | words | string))*]? _close_paren
+            target_index: INT | NEG_INT | index_last
+            index_last: _spaced{"last"}
+            NEG_INT: /-\d+/
+
             target_select: _spaced{"select"} _open_paren target_type [(_comma target_type)*]? _close_paren | target_type [(_comma target_type)*]?
             
             round_specifier: _newlines? "{" expression "}" _newlines?
@@ -334,6 +338,16 @@ class TreeToConfig(Transformer):
 
     def target_named(self, items):
         return TargetType.type_named, items[0]
+
+    def target_index(self, items):
+        return items[0]
+
+    def index_last(self, _):
+        # "last" is spelled -1 from here on: one index form for the resolver to
+        # handle, and `ally(last)` and `ally(-1)` cannot drift apart.
+        return -1
+
+    NEG_INT = int
 
     def target_type(self, items):
         return items[0]

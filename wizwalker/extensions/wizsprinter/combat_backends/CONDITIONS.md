@@ -27,6 +27,39 @@ have its own condition, or none at all.
 | `enemy(N)`  | Nth enemy (0-indexed)                |
 | `ally`      | First ally (same as `ally(0)`)       |
 | `ally(N)`   | Nth ally (0-indexed)                 |
+| `enemy(-N)` | Nth enemy from the end               |
+| `ally(-N)`  | Nth player from the end of your team |
+| `last`      | Spelled in place of an index: `ally(last)`, `enemy(last)` |
+
+### Counting from the end
+
+`last` is `-1`, so `ally(last)` and `ally(-1)` are the same target, as are
+`ally(-2)` and "second from the end".
+
+For enemies this is plain indexing: `enemy(-1)` is the last enemy in the
+circle.
+
+For allies it is not, and the difference is deliberate. A forward `ally(N)`
+counts through the *other* players and leaves you out, so on a full team
+`ally(2)` is the fourth wizard. A backward `ally(-N)` counts through the
+whole team **including yourself**, so that one line means the same wizard on
+every client in the group:
+
+```
+any<blade> @ ally(last)
+```
+
+Team order `P1 P2 P3 P4`, everyone running that line: P1, P2 and P3 blade P4,
+and P4 blades itself.
+
+Written as `ally(2)` instead, the first three still blade P4 -- but P4's own
+ally list is one shorter and holds `P1 P2 P3`, so P4 blades P3 and the group
+no longer agrees on who the hitter is. Including yourself when counting from
+the end is what removes that disagreement.
+
+The practical consequence: `ally(-1)` is not the same as `ally(<count-1>)`,
+and is not meant to be. Use a forward index to name a specific *other*
+player, and a backward one to name a team position.
 
 ### Group targets (require aggregation)
 
@@ -447,7 +480,9 @@ and the enemy has enough traps), the third line fires.
 All condition failures silently skip the priority (return false):
 
 - **Member not found**: no boss in fight, not enough allies/enemies for the
-  index, solo fight with `ally(0)`, etc.
+  index, solo fight with `ally(0)`, etc. A backward index off the end of the
+  team (`ally(-4)` in a two-player fight) is the same non-answer. Solo,
+  `ally(last)` is you, because you are the only player on the team.
 - **Attribute missing**: typo in attribute name or method doesn't exist
 - **No `max_` counterpart**: using `%` with an attribute that has no max
   (e.g. `normal_pips`)

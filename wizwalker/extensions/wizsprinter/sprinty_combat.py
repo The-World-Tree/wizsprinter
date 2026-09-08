@@ -871,17 +871,43 @@ class SprintyCombat(CombatHandler):
                 members.append(mem)
         return members
 
-    async def get_nth_ally_or_none(self, n: int) -> Optional[CombatMember]:
-        allies = await self.get_allies()
-        if len(allies) <= n:
+    async def get_team(self) -> List[CombatMember]:
+        """My whole team in combat-circle order, myself included.
+
+        `get_allies()` leaves me out, which is what a forward `ally(n)` wants.
+        Counting from the end wants the opposite: `ally(-1)` has to name the
+        same wizard on every client in the group, and on the client that *is*
+        last that wizard is me.
+        """
+        members = []
+        my_client = await self.get_client_member()
+        my_participant = await my_client.get_participant()
+        my_team_id = await my_participant.team_id()
+        for mem in await self.get_members():
+            participant = await mem.get_participant()
+            if await participant.team_id() == my_team_id:
+                members.append(mem)
+        return members
+
+    @staticmethod
+    def _at_index(members: List[CombatMember], n: int) -> Optional[CombatMember]:
+        if n < 0:
+            if len(members) < -n:
+                return None
+        elif len(members) <= n:
             return None
-        return allies[n]
+        return members[n]
+
+    async def get_nth_ally_or_none(self, n: int) -> Optional[CombatMember]:
+        # A negative index counts back from the last player on the team and so
+        # reads the team-inclusive list; a non-negative one counts forward from
+        # the first *other* player, as it always has.
+        if n < 0:
+            return self._at_index(await self.get_team(), n)
+        return self._at_index(await self.get_allies(), n)
 
     async def get_nth_enemy_or_none(self, n: int) -> Optional[CombatMember]:
-        enemies = await self.get_enemies()
-        if len(enemies) <= n:
-            return None
-        return enemies[n]
+        return self._at_index(await self.get_enemies(), n)
 
     async def try_get_spell(self, spell: Spell, only_enchants=False, only_enchantable: bool = False, castable: bool = True, multi: bool = False, enchant_bonus: int = 0) -> Union[CombatCard, str, None, List]:
         if isinstance(spell, NamedSpell):
