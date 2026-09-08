@@ -6,7 +6,7 @@ from wizwalker.combat import CombatHandler
 from wizwalker.combat import CombatMember
 from wizwalker.combat.card import CombatCard
 from wizwalker.memory import EffectTarget, SpellEffects, DynamicSpellEffect
-from wizwalker.memory.memory_objects.spell_effect import CompoundSpellEffect, ConditionalSpellEffect, HangingConversionSpellEffect
+from wizwalker.memory.memory_objects.spell_effect import CompoundSpellEffect, ConditionalSpellEffect, HangingConversionSpellEffect, RandomSpellEffect, VariableSpellEffect
 from wizwalker.memory.memory_objects.enums import WindowFlags, HangingDisposition, HangingEffectType, EffectTarget
 from wizwalker.memory.memory_objects.conditionals import charm_effect_types, ward_effect_types, over_time_effect_types, aura_effect_types
 
@@ -15,6 +15,9 @@ from .combat_backends.combat_config_parser import TargetType, TargetData, MoveCo
     , GambitSpec, ClearSpec, EchoSpec, SwapSpec, HangingType, HANGING_CATEGORIES, hanging_type_info
 from wizwalker.memory.memory_objects.conditionals import ReqHangingAura
 from .combat_backends.backend_base import BaseCombatBackend
+from .combat_backends.spell_ranking import (
+    AllOf, CardFacts, DamageAmount, DamageNode, OneOf, rank_facts, ranker_for,
+)
 
 from enum import Enum, auto
 from collections import Counter
@@ -83,6 +86,12 @@ damage_effects = {
     SpellEffects.divide_damage,
     SpellEffects.steal_health,
     SpellEffects.max_health_damage
+}
+
+# Damage that scales with pips spent rather than a fixed amount, so the
+# param is per-pip and not comparable with a fixed-damage spell's.
+per_pip_damage_effects = {
+    SpellEffects.damage_per_total_pip_power,
 }
 
 buff_damage_effects = {
@@ -394,6 +403,114 @@ async def does_card_contain_reqs(card: CombatCard, template: TemplateSpell) -> b
     return matched_reqs == needed_matches
 
 
+async def card_is_per_pip(card: CombatCard) -> bool:
+    """Whether the card's damage scales with the pips spent on it.
+
+    Tempest and friends read 80 *per pip*, so their effect_param cannot be
+    compared against a fixed-damage spell's. The spell's own rank carries the
+    flag; the effect type is checked too because an X-pip cost and a per-pip
+    payout are separate facts and either one makes the param incomparable.
+    """
+    for effect in await get_inner_card_effects(card):
+        if await effect.effect_type() in per_pip_damage_effects:
+            return True
+    try:
+        spell = await card.get_graphical_spell()
+        rank = await spell.pip_cost()
+    except Exception:
+        return False
+    if rank is None:
+        return False
+    return await rank.is_xpip_spell()
+
+
+async def _damage_node(effect, aoe_only: bool, depth: int = 0) -> DamageNode:
+    """Build the scoring tree for one effect, keeping its container shape.
+
+    This deliberately does *not* go through `get_inner_card_effects`. That
+    flattens every container alike, which is correct for matching — the
+    question there is whether any leaf satisfies a requirement — but it erases
+    the difference between effects that all land and effects that are
+    alternatives. A random-damage spell stores one effect per possible roll, so
+    flattening and summing scores Humongofrog as 575+585+595+605+615.
+    """
+    if depth > 8:  # Cycle / pathological-nesting guard, as in _flatten_effect.
+        return AllOf()
+    cls = type(effect)
+
+    # Checked before CompoundSpellEffect: both subclass it, and the whole point
+    # is that these hold alternatives rather than a list that all lands.
+    # RandomPerTargetSpellEffect subclasses RandomSpellEffect, so it is covered.
+    if issubclass(cls, (RandomSpellEffect, VariableSpellEffect)):
+        return OneOf(tuple([await _damage_node(sub, aoe_only, depth + 1) for sub in await effect.effects_list()]))
+
+    if issubclass(cls, CompoundSpellEffect):  # EffectList / Shadow / ShadowPact
+        return AllOf(tuple([await _damage_node(sub, aoe_only, depth + 1) for sub in await effect.effects_list()]))
+
+    if issubclass(cls, ConditionalSpellEffect):
+        return OneOf(
+            tuple([await _damage_node(await el.effect(), aoe_only, depth + 1) for el in await effect.elements()])
+        )
+
+    if issubclass(cls, HangingConversionSpellEffect):
+        return AllOf(tuple([await _damage_node(sub, aoe_only, depth + 1) for sub in await effect.output_effect()]))
+
+    # Leaf. The filter mirrors `is_damage()` above — a damage effect aimed at an
+    # enemy with a positive param — so ranking scores exactly what matching
+    # matched. `effect_param` is used as-is: on a live client it is the *total*
+    # for a damage-over-time effect and it already includes any enchantment on
+    # the card, so neither needs correcting for here.
+    eff_type = await effect.effect_type()
+    target = await effect.effect_target()
+    param = await effect.effect_param()
+    if eff_type not in damage_effects or target not in enemy_targets or param <= 0:
+        return AllOf()
+    if aoe_only and target not in aoe_targets:
+        return AllOf()
+    return DamageAmount(param)
+
+
+async def card_damage_facts(card: CombatCard, aoe_only: bool, enchant_bonus: int = 0) -> CardFacts:
+    """Classify a card's damage for `spell_ranking`."""
+    # Top-level effects all land together, so the card itself is an AllOf.
+    tree = AllOf(tuple([await _damage_node(e, aoe_only) for e in await card.get_spell_effects()]))
+
+    # A card that already carries an enchant cannot receive the pending one.
+    bonus = enchant_bonus if enchant_bonus and await is_enchantable(card) else 0
+    return CardFacts(is_per_pip=await card_is_per_pip(card), damage=tree, enchant_bonus=bonus)
+
+
+async def rank_cards_by_template(
+    cards: List[CombatCard], template: TemplateSpell, enchant_bonus: int = 0
+) -> List[CombatCard]:
+    """Order matched cards best-first for their category.
+
+    Templates in a category with no registered ranker come back untouched, so
+    this is a no-op for everything but damage and AoE today.
+    """
+    ranker = ranker_for(template)
+    if ranker is None or len(cards) < 2:
+        return cards
+
+    facts = [await card_damage_facts(c, ranker.aoe_only, enchant_bonus) for c in cards]
+    return [cards[i] for i in rank_facts(facts, ranker)]
+
+
+async def enchant_damage_bonus(card: CombatCard) -> int:
+    """How much damage an enchant card would add to whatever it is cast on.
+
+    Zero for anything that is not a damage enchant, which keeps a non-damage
+    enchant clause from perturbing the ranking.
+    """
+    for effect in await get_inner_card_effects(card):
+        if (
+            await effect.effect_type() is SpellEffects.modify_card_damage
+            and await effect.effect_target() is EffectTarget.spell
+        ):
+            return max(await effect.effect_param(), 0)
+    return 0
+
+
 async def card_requires_target_selection(card: CombatCard) -> bool:
     """Check if a card requires the player to select a target (i.e. not a true AOE).
     Returns True if any damage/steal effect targets a single enemy rather than a team,
@@ -610,23 +727,23 @@ class SprintyCombat(CombatHandler):
                 return s
         return None
 
-    async def get_castable_cards_by_template(self, template: TemplateSpell) -> List[CombatCard]:
+    async def get_castable_cards_by_template(self, template: TemplateSpell, enchant_bonus: int = 0) -> List[CombatCard]:
         cards = await self.get_castable_cards()
         res = []
         for c in cards:
             if await does_card_contain_reqs(c, template):
                 res.append(c)
 
-        return res
+        return await rank_cards_by_template(res, template, enchant_bonus)
 
-    async def get_cards_by_template(self, template: TemplateSpell) -> List[CombatCard]:
+    async def get_cards_by_template(self, template: TemplateSpell, enchant_bonus: int = 0) -> List[CombatCard]:
         cards = await self.get_cards()
         res = []
         for c in cards:
             if await does_card_contain_reqs(c, template):
                 res.append(c)
 
-        return res
+        return await rank_cards_by_template(res, template, enchant_bonus)
 
 
     async def get_boss_or_none(self) -> Optional[CombatMember]:
@@ -671,7 +788,7 @@ class SprintyCombat(CombatHandler):
             return None
         return enemies[n]
 
-    async def try_get_spell(self, spell: Spell, only_enchants=False, only_enchantable: bool = False, castable: bool = True, multi: bool = False) -> Union[CombatCard, str, None, List]:
+    async def try_get_spell(self, spell: Spell, only_enchants=False, only_enchantable: bool = False, castable: bool = True, multi: bool = False, enchant_bonus: int = 0) -> Union[CombatCard, str, None, List]:
         if isinstance(spell, NamedSpell):
             spell: NamedSpell
             if spell.name in ("pass", "none", "willcast", "discard"):
@@ -709,9 +826,9 @@ class SprintyCombat(CombatHandler):
             spell: TemplateSpell
             res = None
             if castable:
-                res = await self.get_castable_cards_by_template(spell)
+                res = await self.get_castable_cards_by_template(spell, enchant_bonus)
             else:
-                res = await self.get_cards_by_template(spell)
+                res = await self.get_cards_by_template(spell, enchant_bonus)
 
             if only_enchantable:
                 res = [c for c in res if await is_enchantable(c)]
