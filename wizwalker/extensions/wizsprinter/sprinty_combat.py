@@ -1657,7 +1657,25 @@ class SprintyCombat(CombatHandler):
                     await asyncio.sleep(self.config.cast_time*2)
 
             return True
-        only_enchantable = move_config.move.enchant is not None
+        # An enchant clause narrows the card pool to cards that can still take
+        # an enchant — but only when the clause is mandatory. An *optional*
+        # enchant must not exclude an already-enchanted card, or the move casts
+        # a weaker bare spell while a stronger enchanted one sits in hand.
+        enchant_spec = move_config.move.enchant
+        wants_enchant = enchant_spec is not None
+        enchant_optional = isinstance(enchant_spec, TemplateSpell) and enchant_spec.optional
+        only_enchantable = wants_enchant and not enchant_optional
+
+        # Looked up before the card is picked so its damage can be weighed
+        # against the cards that already carry an enchant. Reused below rather
+        # than read a second time.
+        enchant_card = None
+        enchant_bonus = 0
+        if wants_enchant:
+            enchant_card = await self.try_get_spell(enchant_spec, only_enchants=False, castable=False)
+            if isinstance(enchant_card, CombatCard):
+                enchant_bonus = await enchant_damage_bonus(enchant_card)
+
         is_template = isinstance(move_config.move.card, TemplateSpell)
         needs_req_met = is_template and SpellType.type_req_met in move_config.move.card.requirements
         gambit_clear_specs = (
@@ -1685,13 +1703,16 @@ class SprintyCombat(CombatHandler):
         # castable match (rather than failing the whole clause).
         if needs_post_filter:
             candidates = await self.try_get_spell(
-                move_config.move.card, only_enchantable=only_enchantable, multi=True
+                move_config.move.card, only_enchantable=only_enchantable, multi=True,
+                enchant_bonus=enchant_bonus,
             )
             if not candidates:
                 _dbg(f"[MT-DBG] no candidates for {move_config.move.card}")
                 return False
         else:
-            single = await self.try_get_spell(move_config.move.card, only_enchantable=only_enchantable)
+            single = await self.try_get_spell(
+                move_config.move.card, only_enchantable=only_enchantable, enchant_bonus=enchant_bonus
+            )
             if single is None:
                 _dbg(f"[MT-DBG] cur_card is None for {move_config.move.card}")
                 return False
@@ -1778,14 +1799,22 @@ class SprintyCombat(CombatHandler):
                 _dbg(f"[MT-DBG] wrapped single target in list")
 
         fused = ""
-        if only_enchantable and not await cur_card.is_enchanted():
-            enchant_card = await self.try_get_spell(move_config.move.enchant, only_enchants=False, castable=False)
+        # is_enchantable covers the already-enchanted case along with treasure,
+        # item and cloaked cards, none of which can take an enchant either. With
+        # an optional clause the chosen card may legitimately be one of those,
+        # in which case it is cast as-is.
+        if wants_enchant and await is_enchantable(cur_card):
             if enchant_card != "none":
                 if enchant_card is not None:
                     # Issue: 5. Casting wasn't that reliable
                     enchant_is_grayed = not await enchant_card.is_castable()
                     if enchant_is_grayed:
-                        return False
+                        # An optional enchant that cannot be cast is skipped;
+                        # only a mandatory one fails the whole clause.
+                        if not enchant_optional:
+                            return False
+                        enchant_card = None
+                if enchant_card is not None:
                     previous_cards = await self.get_cards()
                     previous_card_names = Counter([await card.name() for card in previous_cards])
                     pre_enchant_count = len(await self.get_cards())
