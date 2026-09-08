@@ -16,7 +16,8 @@ from .combat_backends.combat_config_parser import TargetType, TargetData, MoveCo
 from wizwalker.memory.memory_objects.conditionals import ReqHangingAura
 from .combat_backends.backend_base import BaseCombatBackend
 from .combat_backends.spell_ranking import (
-    AllOf, CardFacts, DamageAmount, DamageNode, OneOf, rank_facts, ranker_for,
+    AllOf, Amount, CardFacts, CardSource, CategoryRanker, OneOf, ScoreNode,
+    expected_value, rank_facts, ranker_for,
 )
 
 from enum import Enum, auto
@@ -92,6 +93,16 @@ damage_effects = {
 # param is per-pip and not comparable with a fixed-damage spell's.
 per_pip_damage_effects = {
     SpellEffects.damage_per_total_pip_power,
+}
+
+# Modifiers that add a flat amount rather than a percentage. Both read as a
+# bare int, so ranking scores a card on one kind or the other and never
+# compares across them — see `card_facts`.
+flat_buff_effects = {
+    SpellEffects.modify_incoming_damage_flat,
+    SpellEffects.modify_outgoing_damage_flat,
+    SpellEffects.modify_incoming_heal_flat,
+    SpellEffects.modify_outgoing_heal_flat,
 }
 
 buff_damage_effects = {
@@ -424,7 +435,50 @@ async def card_is_per_pip(card: CombatCard) -> bool:
     return await rank.is_xpip_spell()
 
 
-async def _damage_node(effect, aoe_only: bool, depth: int = 0) -> DamageNode:
+async def card_pip_cost(card: CombatCard) -> int:
+    """Total pips to cast the card, shadow pips included.
+
+    The school-pip requirements are deliberately ignored: they say *which* pips
+    the cost has to be paid with, not how many, and the caller only reaches
+    ranking with cards that are already castable.
+    """
+    try:
+        spell = await card.get_graphical_spell()
+        rank = await spell.pip_cost()
+        if rank is None:
+            return 0
+        return await rank.spell_rank() + await rank.shadow_pips()
+    except Exception:
+        return 0
+
+
+async def card_source(card: CombatCard) -> CardSource:
+    """Where the card came from, which decides which copy to spend first."""
+    try:
+        if await card.is_item_card():
+            return CardSource.item
+        if await card.is_treasure_card():
+            return CardSource.treasure
+    except Exception:
+        pass
+    return CardSource.deck
+
+
+async def card_is_enchanted(card: CombatCard) -> bool:
+    """Whether the card already carries an enchant, from either source.
+
+    Not `not is_enchantable(card)`: that is also false for treasure, item and
+    cloaked cards, which `card_source` reports separately.
+    """
+    try:
+        return await card.is_enchanted() or await card.is_enchanted_from_item_card()
+    except Exception:
+        return False
+
+
+async def _score_node(
+    effect, ranker: CategoryRanker, template: TemplateSpell, allow_aoe: bool, flat: bool, depth: int = 0
+) -> ScoreNode:
     """Build the scoring tree for one effect, keeping its container shape.
 
     This deliberately does *not* go through `get_inner_card_effects`. That
@@ -438,46 +492,76 @@ async def _damage_node(effect, aoe_only: bool, depth: int = 0) -> DamageNode:
         return AllOf()
     cls = type(effect)
 
+    async def recurse(sub) -> ScoreNode:
+        return await _score_node(sub, ranker, template, allow_aoe, flat, depth + 1)
+
     # Checked before CompoundSpellEffect: both subclass it, and the whole point
     # is that these hold alternatives rather than a list that all lands.
     # RandomPerTargetSpellEffect subclasses RandomSpellEffect, so it is covered.
     if issubclass(cls, (RandomSpellEffect, VariableSpellEffect)):
-        return OneOf(tuple([await _damage_node(sub, aoe_only, depth + 1) for sub in await effect.effects_list()]))
+        return OneOf(tuple([await recurse(sub) for sub in await effect.effects_list()]))
 
     if issubclass(cls, CompoundSpellEffect):  # EffectList / Shadow / ShadowPact
-        return AllOf(tuple([await _damage_node(sub, aoe_only, depth + 1) for sub in await effect.effects_list()]))
+        return AllOf(tuple([await recurse(sub) for sub in await effect.effects_list()]))
 
     if issubclass(cls, ConditionalSpellEffect):
-        return OneOf(
-            tuple([await _damage_node(await el.effect(), aoe_only, depth + 1) for el in await effect.elements()])
-        )
+        return OneOf(tuple([await recurse(await el.effect()) for el in await effect.elements()]))
 
     if issubclass(cls, HangingConversionSpellEffect):
-        return AllOf(tuple([await _damage_node(sub, aoe_only, depth + 1) for sub in await effect.output_effect()]))
+        return AllOf(tuple([await recurse(sub) for sub in await effect.output_effect()]))
 
-    # Leaf. The filter mirrors `is_damage()` above — a damage effect aimed at an
-    # enemy with a positive param — so ranking scores exactly what matching
-    # matched. `effect_param` is used as-is: on a live client it is the *total*
-    # for a damage-over-time effect and it already includes any enchantment on
-    # the card, so neither needs correcting for here.
+    # Leaf. The filter is `is_req_satisfied` itself rather than a copy of its
+    # conditions, so ranking scores exactly what matching matched — including
+    # the sign convention that makes a ward's param negative.
+    if await is_req_satisfied(effect, ranker.score_type, template, allow_aoe) is not ReqSatisfaction.true:
+        return AllOf()
+
     eff_type = await effect.effect_type()
-    target = await effect.effect_target()
-    param = await effect.effect_param()
-    if eff_type not in damage_effects or target not in enemy_targets or param <= 0:
+    if (eff_type in flat_buff_effects) is not flat:
         return AllOf()
-    if aoe_only and target not in aoe_targets:
+
+    if ranker.aoe_only and await effect.effect_target() not in aoe_targets:
         return AllOf()
-    return DamageAmount(param)
+
+    # `effect_param` is used as-is beyond the sign: on a live client it is the
+    # *total* for a damage-over-time effect and it already includes any
+    # enchantment on the card, so neither needs correcting for here.
+    return Amount(abs(await effect.effect_param()))
 
 
-async def card_damage_facts(card: CombatCard, aoe_only: bool, enchant_bonus: int = 0) -> CardFacts:
-    """Classify a card's damage for `spell_ranking`."""
-    # Top-level effects all land together, so the card itself is an AllOf.
-    tree = AllOf(tuple([await _damage_node(e, aoe_only) for e in await card.get_spell_effects()]))
+async def card_facts(
+    card: CombatCard, ranker: CategoryRanker, template: TemplateSpell, enchant_bonus: int = 0
+) -> CardFacts:
+    """Classify one card for `spell_ranking`."""
+    allow_aoe = SpellType.type_aoe in template.requirements
+    effects = await card.get_spell_effects()
+
+    async def tree(flat: bool) -> ScoreNode:
+        # Top-level effects all land together, so the card itself is an AllOf.
+        return AllOf(tuple([await _score_node(e, ranker, template, allow_aoe, flat) for e in effects]))
+
+    # Percentage and flat modifiers both read as a bare int, so a card is
+    # scored on one kind or the other and never on a sum of the two. A card
+    # with any percentage effect is a percentage card; the flat pass is only
+    # reached by the rare card that is flat-only.
+    score = await tree(flat=False)
+    is_flat = False
+    if expected_value(score) == 0:
+        flat_score = await tree(flat=True)
+        if expected_value(flat_score) > 0:
+            score, is_flat = flat_score, True
 
     # A card that already carries an enchant cannot receive the pending one.
     bonus = enchant_bonus if enchant_bonus and await is_enchantable(card) else 0
-    return CardFacts(is_per_pip=await card_is_per_pip(card), damage=tree, enchant_bonus=bonus)
+    return CardFacts(
+        is_per_pip=await card_is_per_pip(card),
+        score=score,
+        enchant_bonus=bonus,
+        is_flat=is_flat,
+        pip_cost=await card_pip_cost(card),
+        source=await card_source(card),
+        is_enchanted=await card_is_enchanted(card),
+    )
 
 
 async def rank_cards_by_template(
@@ -486,13 +570,13 @@ async def rank_cards_by_template(
     """Order matched cards best-first for their category.
 
     Templates in a category with no registered ranker come back untouched, so
-    this is a no-op for everything but damage and AoE today.
+    this is a no-op for the categories `CATEGORY_RANKERS` does not name.
     """
     ranker = ranker_for(template)
     if ranker is None or len(cards) < 2:
         return cards
 
-    facts = [await card_damage_facts(c, ranker.aoe_only, enchant_bonus) for c in cards]
+    facts = [await card_facts(c, ranker, template, enchant_bonus) for c in cards]
     return [cards[i] for i in rank_facts(facts, ranker)]
 
 
