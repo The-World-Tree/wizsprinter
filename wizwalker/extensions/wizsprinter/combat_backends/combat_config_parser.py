@@ -149,15 +149,19 @@ def get_sprinty_grammar():
 
 class TreeToConfig(Transformer):
     def spell(self, items, enchant: bool = False):
+        # Every enchant clause is optional, whichever form it is written in:
+        # `[sharp]` and `[any<mod_damage>]` both mean "enchant it if the enchant
+        # is in hand", never "skip this move without one". A mandatory enchant
+        # narrows the card pool to enchantable cards, which silently excludes
+        # item, treasure and cloaked cards -- so `any<blade>[sharp]` refused to
+        # cast an item-card blade even with no Sharpened Blade in hand.
         if type(items[0]) is not str:
-            if enchant:
-                return TemplateSpell(items[0], optional=True)
-            return TemplateSpell(items[0])
+            return TemplateSpell(items[0], optional=enchant)
         else:
             name: str = items[0]
             if name.startswith("\""):
-                return NamedSpell(name[1:-1], True)
-            return NamedSpell(name, False)
+                return NamedSpell(name[1:-1], True, optional=enchant)
+            return NamedSpell(name, False, optional=enchant)
 
     def enchant(self, items):
         return self.spell(items, enchant=True)

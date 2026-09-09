@@ -115,12 +115,16 @@ class DrawSpell(Spell):
         return f"DrawSpell(draw_amount={self.draw_amount})"
 
 class NamedSpell(Spell):
-    def __init__(self, name: str, is_literal: bool = False):
+    def __init__(self, name: str, is_literal: bool = False, optional: bool = False) -> None:
         self.name = name
         self.is_literal = is_literal
+        # Only meaningful in enchant position, where it means the same thing it
+        # does on TemplateSpell: enchant the card if the enchant is in hand,
+        # cast it bare if it is not. See `TreeToConfig.spell`.
+        self.optional = optional
 
     def __repr__(self) -> str:
-        return f"NamedSpell(name=\"{self.name}\", is_literal={self.is_literal})"
+        return f"NamedSpell(name=\"{self.name}\", is_literal={self.is_literal}, optional={self.optional})"
 
 
 # --- Hanging-effect category registry -------------------------------------

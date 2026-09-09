@@ -67,6 +67,17 @@ async def get_inner_card_effects(card: CombatCard) -> List[DynamicSpellEffect]:
     return output_effects
 
 
+def enchant_is_optional(spec) -> bool:
+    """Whether a missing or uncastable enchant may be skipped.
+
+    Both spell forms carry the flag, and the parser sets it on every enchant it
+    builds: `[sharp]` and `[any<mod_damage>]` alike mean "enchant it if the
+    enchant is in hand". Read with `getattr` so a spec built in code before the
+    flag existed still reads as mandatory rather than raising.
+    """
+    return getattr(spec, "optional", False)
+
+
 async def is_enchantable(card: CombatCard) -> bool:
     return not any((
         await card.is_enchanted(),
@@ -1781,10 +1792,14 @@ class SprintyCombat(CombatHandler):
         # An enchant clause narrows the card pool to cards that can still take
         # an enchant — but only when the clause is mandatory. An *optional*
         # enchant must not exclude an already-enchanted card, or the move casts
-        # a weaker bare spell while a stronger enchanted one sits in hand.
+        # a weaker bare spell while a stronger enchanted one sits in hand. It
+        # must not exclude an item, treasure or cloaked card either: those can
+        # never take an enchant, so a narrowed pool drops them outright.
+        # Every enchant the parser produces is optional, in either form; the
+        # mandatory path is left for a config built in code that asks for it.
         enchant_spec = move_config.move.enchant
         wants_enchant = enchant_spec is not None
-        enchant_optional = isinstance(enchant_spec, TemplateSpell) and enchant_spec.optional
+        enchant_optional = enchant_is_optional(enchant_spec)
         only_enchantable = wants_enchant and not enchant_optional
 
         # Looked up before the card is picked so its damage can be weighed
@@ -1959,12 +1974,12 @@ class SprintyCombat(CombatHandler):
                                         await asyncio.sleep(self.config.cast_time*2) # give it some time for card list to update
                                     self.cur_card_count -= 1
                                 
-                                elif second_enchant_card is None and (isinstance(move_config.move.second_enchant, TemplateSpell) and not move_config.move.second_enchant.optional):
+                                elif second_enchant_card is None and not enchant_is_optional(move_config.move.second_enchant):
                                     return False
 
                         fused = diff[0]
 
-                elif enchant_card is None and (isinstance(move_config.move.enchant, TemplateSpell) and not move_config.move.enchant.optional):
+                elif enchant_card is None and not enchant_optional:
                     return False
                 
                 #elif enchant_card is None and enchant_is_grayed:
