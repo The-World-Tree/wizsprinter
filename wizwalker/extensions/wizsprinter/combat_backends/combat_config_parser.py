@@ -10,9 +10,9 @@ from .combat_api import *
 def get_sprinty_grammar():
     return r"""
             ?start: config
-            config: line+
+            config: _newlines line (_NEWLINE+ line)* _newlines
             
-            line: round_specifier? move_config [(_pipe move_config)*]? _NEWLINE?
+            line: round_specifier? move_config [(_pipe move_config)*]?
             
             move_config: condition? move (_at target)? [(_and move (_at target)?)*]?
 
