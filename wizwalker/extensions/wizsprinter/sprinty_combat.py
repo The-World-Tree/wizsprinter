@@ -198,21 +198,23 @@ def get_req_status(req_statement: bool) -> ReqSatisfaction:
     return ReqSatisfaction.false
 
 
-async def is_req_satisfied(effect: DynamicSpellEffect, req: SpellType, template: TemplateSpell, allow_aoe: bool = False) -> bool:
+async def is_req_satisfied(effect: DynamicSpellEffect, req: SpellType, template: TemplateSpell) -> bool:
     eff_type = await effect.effect_type()
     target = await effect.effect_target()
     param = await effect.effect_param()
     rounds = await effect.num_rounds()
 
-    _aoe_targets = aoe_targets
-    if not allow_aoe:
-        _aoe_targets = {}
-
+    # Blade, charm, ward and trap match a single-target effect and a team one
+    # alike: `any<trap>` includes Mass Feint, and `any<trap & aoe>` is a mass
+    # trap. These once took the AoE targets out whenever `aoe` was in the same
+    # template, so `any<trap & aoe>` needed a single-target trap *and* some team
+    # effect, and never matched a mass trap. Single-target only is
+    # `any<trap & !aoe>`.
 
     def is_blade() -> bool:
         return all((
             eff_type in charm_effects,
-            target in ally_targets.difference(_aoe_targets),
+            target in ally_targets,
             param > 0,
             rounds == 0,
         ))
@@ -220,7 +222,7 @@ async def is_req_satisfied(effect: DynamicSpellEffect, req: SpellType, template:
     def is_charm() -> bool:
         return all((
             eff_type in charm_effects,
-            target in enemy_targets.difference(_aoe_targets),
+            target in enemy_targets,
             param < 0,
             rounds == 0,
         ))
@@ -228,7 +230,7 @@ async def is_req_satisfied(effect: DynamicSpellEffect, req: SpellType, template:
     def is_ward() -> bool:
         return all((
             eff_type in ward_effects,
-            target in ally_targets.difference(_aoe_targets),
+            target in ally_targets,
             param < 0,
             rounds == 0,
         ))
@@ -236,7 +238,7 @@ async def is_req_satisfied(effect: DynamicSpellEffect, req: SpellType, template:
     def is_trap() -> bool:
         return all((
             eff_type in ward_effects,
-            target in enemy_targets.difference(_aoe_targets),
+            target in enemy_targets,
             param > 0,
             rounds == 0,
         ))
@@ -382,12 +384,9 @@ async def card_is_excluded(card: CombatCard, effects: List[DynamicSpellEffect], 
         card_name = await card.name()
         if any(name_matches(r.name, card_name, r.is_literal) for r in excluded_names):
             return True
-    # `!trap` means no trap of any kind, mass traps included. allow_aoe=True would
-    # narrow blade/charm/ward/trap to single-target effects, as it does when `aoe`
-    # sits beside them, so a negation always checks with it off.
     for spell_type in negated_types:
         for e in effects:
-            if await is_req_satisfied(e, spell_type, template, allow_aoe=False) is ReqSatisfaction.true:
+            if await is_req_satisfied(e, spell_type, template) is ReqSatisfaction.true:
                 return True
     return False
 
@@ -417,7 +416,7 @@ async def does_card_contain_reqs(card: CombatCard, template: TemplateSpell) -> b
 
     for req in reqs_to_check:
         for e in effects:
-            req_status = await is_req_satisfied(e, req, template, is_aoe_req)
+            req_status = await is_req_satisfied(e, req, template)
             match req_status:
                 case ReqSatisfaction.true:
                     matched_reqs += 1
@@ -518,7 +517,7 @@ async def card_is_enchanted(card: CombatCard) -> bool:
 
 
 async def _score_node(
-    effect, ranker: CategoryRanker, template: TemplateSpell, allow_aoe: bool, flat: bool, depth: int = 0
+    effect, ranker: CategoryRanker, template: TemplateSpell, flat: bool, depth: int = 0
 ) -> ScoreNode:
     """Build the scoring tree for one effect, keeping its container shape.
 
@@ -539,7 +538,7 @@ async def _score_node(
     cls = type(effect)
 
     async def recurse(sub) -> ScoreNode:
-        return await _score_node(sub, ranker, template, allow_aoe, flat, depth + 1)
+        return await _score_node(sub, ranker, template, flat, depth + 1)
 
     # Checked before CompoundSpellEffect: both subclass it, and the whole point
     # is that these hold alternatives rather than a list that all lands.
@@ -559,7 +558,7 @@ async def _score_node(
     # Leaf. The filter is `is_req_satisfied` itself rather than a copy of its
     # conditions, so ranking scores exactly what matching matched — including
     # the sign convention that makes a ward's param negative.
-    if await is_req_satisfied(effect, ranker.score_type, template, allow_aoe) is not ReqSatisfaction.true:
+    if await is_req_satisfied(effect, ranker.score_type, template) is not ReqSatisfaction.true:
         return lands_together()
 
     eff_type = await effect.effect_type()
@@ -581,14 +580,13 @@ async def card_facts(
     card: CombatCard, ranker: CategoryRanker, template: TemplateSpell, enchant_bonus: int = 0
 ) -> CardFacts:
     """Classify one card for `spell_ranking`."""
-    allow_aoe = SpellType.type_aoe in template.requirements
     effects = await card.get_spell_effects()
     lands_together = AllOf if ranker.effects_stack else BestOf
 
     async def tree(flat: bool) -> ScoreNode:
         # The card's top-level effects all land, so they combine the same way
         # the children of any other landing container do.
-        return lands_together(tuple([await _score_node(e, ranker, template, allow_aoe, flat) for e in effects]))
+        return lands_together(tuple([await _score_node(e, ranker, template, flat) for e in effects]))
 
     # Percentage and flat modifiers both read as a bare int, so a card is
     # scored on one kind or the other and never on a sum of the two. A card
