@@ -76,7 +76,13 @@ def get_sprinty_grammar():
             
             auto: _spaced{"auto"}
             
-            any_spell: _spaced{"any"} _less_than spell_type [(_and spell_type)*]? _greater_than
+            any_spell: _spaced{"any"} _less_than spell_filter [(_and spell_filter)*]? _greater_than
+            // `!aoe` negates a type and `!feint` excludes a name. With the dynamic
+            // lexer `!trap` also reads as a name, so the type form outranks it.
+            ?spell_filter: spell_type | neg_type | neg_name
+            neg_type.2: _not spell_type
+            neg_name: _not (words | string)
+            _not: _spaced{"!"}
             spell_type: spell_damage | spell_aoe | spell_heal_self | spell_heal_other | spell_heal | spell_blade | spell_charm | spell_ward | spell_trap | spell_enchant | spell_aura | spell_global | spell_polymorph | spell_shadow | spell_shadow_creature | spell_pierce | spell_prism | spell_dispel | spell_inc_damage | spell_out_damage | spell_inc_heal | spell_out_heal | spell_mod_damage | spell_mod_heal | spell_mod_pierce | spell_req_met | spell_gambit | spell_clear | spell_echo | spell_swap
             spell_damage: _spaced{"damage"}
             spell_aoe: _spaced{"aoe"}
@@ -364,6 +370,20 @@ class TreeToConfig(Transformer):
 
     def any_spell(self, items):
         return items
+
+    def neg_type(self, items):
+        spell_type = items[0]
+        # A hanging verb and req_met are checked after selection, not per effect,
+        # so there is nothing for a negation of one to test a card against.
+        if not isinstance(spell_type, SpellType) or spell_type is SpellType.type_req_met:
+            raise ValueError(f"Only a spell type can be negated inside any<...>, not {spell_type}")
+        return NotTypeSpec(spell_type)
+
+    def neg_name(self, items):
+        name: str = items[0]
+        if name.startswith("\""):
+            return ExcludeNameSpec(name[1:-1], True)
+        return ExcludeNameSpec(name, False)
 
     def spell_type(self, items):
         return items[0]

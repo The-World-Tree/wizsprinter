@@ -236,11 +236,35 @@ class SwapSpec:
         return f"SwapSpec(hanging_type={self.hanging_type}, min_count={self.min_count})"
 
 
+class NotTypeSpec:
+    """`!aoe` inside any<...>: reject a card any of whose effects is this type.
+
+    No __eq__ on purpose -- `SpellType.type_aoe in requirements` must not match a
+    negated aoe."""
+    def __init__(self, type: SpellType):
+        self.type = type
+
+    def __repr__(self) -> str:
+        return f"NotTypeSpec(type={self.type})"
+
+
+class ExcludeNameSpec:
+    """`!feint` inside any<...>: reject a card by name. Unquoted is the loose,
+    case-insensitive substring match a bare spell move uses; quoted is exact."""
+    def __init__(self, name: str, is_literal: bool = False):
+        self.name = name
+        self.is_literal = is_literal
+
+    def __repr__(self) -> str:
+        return f"ExcludeNameSpec(name=\"{self.name}\", is_literal={self.is_literal})"
+
+
 class TemplateSpell(Spell):
     def __init__(self, requirements: List, optional=False) -> None:
         # `requirements` is a heterogeneous list of SpellType values plus optional
-        # post-selection filter specs (GambitSpec / ClearSpec). req_met stays as a
-        # SpellType sentinel so existing parsing keeps working.
+        # post-selection filter specs (GambitSpec / ClearSpec) and the negations
+        # (NotTypeSpec / ExcludeNameSpec). req_met stays as a SpellType sentinel so
+        # existing parsing keeps working.
         self.requirements = requirements
         self.optional = optional
 

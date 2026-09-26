@@ -12,7 +12,8 @@ from wizwalker.memory.memory_objects.conditionals import charm_effect_types, war
 
 from .combat_backends.combat_config_parser import TargetType, TargetData, MoveConfig, TemplateSpell \
     , NamedSpell, SpellType, Spell, DrawSpell, Condition, AllCondition, ConditionTarget, ComparisonOp, AggregationMode \
-    , GambitSpec, ClearSpec, EchoSpec, SwapSpec, HangingType, HANGING_CATEGORIES, hanging_type_info
+    , GambitSpec, ClearSpec, EchoSpec, SwapSpec, NotTypeSpec, ExcludeNameSpec, HangingType, HANGING_CATEGORIES \
+    , hanging_type_info
 from wizwalker.memory.memory_objects.conditionals import ReqHangingAura
 from .combat_backends.backend_base import BaseCombatBackend
 from .combat_backends.spell_ranking import (
@@ -365,16 +366,45 @@ async def is_req_satisfied(effect: DynamicSpellEffect, req: SpellType, template:
     return get_req_status(is_satisfied)
         
 
+def name_matches(written: str, card_name: str, is_literal: bool) -> bool:
+    """A name as a DSL writes it against a card's: exact when quoted, otherwise the
+    loose, case-insensitive substring match of `get_castable_cards_vaguely_named`."""
+    if is_literal:
+        return written == card_name
+    return written.lower() in card_name.lower()
+
+
+async def card_is_excluded(card: CombatCard, effects: List[DynamicSpellEffect], template: TemplateSpell) -> bool:
+    """Whether a `!type` or `!name` inside any<...> rules the card out."""
+    negated_types = [r.type for r in template.requirements if isinstance(r, NotTypeSpec)]
+    excluded_names = [r for r in template.requirements if isinstance(r, ExcludeNameSpec)]
+    if excluded_names:
+        card_name = await card.name()
+        if any(name_matches(r.name, card_name, r.is_literal) for r in excluded_names):
+            return True
+    # `!trap` means no trap of any kind, mass traps included. allow_aoe=True would
+    # narrow blade/charm/ward/trap to single-target effects, as it does when `aoe`
+    # sits beside them, so a negation always checks with it off.
+    for spell_type in negated_types:
+        for e in effects:
+            if await is_req_satisfied(e, spell_type, template, allow_aoe=False) is ReqSatisfaction.true:
+                return True
+    return False
+
+
 async def does_card_contain_reqs(card: CombatCard, template: TemplateSpell) -> bool:
     effects = await get_inner_card_effects(card)
     is_aoe_req = SpellType.type_aoe in template.requirements
     # req_met / gambit() / clear() / echo() / swap() are meta-filters checked
-    # post-selection, not per-effect.
+    # post-selection, not per-effect. The negations are checked here, but reject
+    # rather than count toward a match.
     reqs_to_check = [
         r for r in template.requirements
         if r is not SpellType.type_req_met
-        and not isinstance(r, (GambitSpec, ClearSpec, EchoSpec, SwapSpec))
+        and not isinstance(r, (GambitSpec, ClearSpec, EchoSpec, SwapSpec, NotTypeSpec, ExcludeNameSpec))
     ]
+    if await card_is_excluded(card, effects, template):
+        return False
     matched_reqs = 0
     needed_matches = len(reqs_to_check)
 
