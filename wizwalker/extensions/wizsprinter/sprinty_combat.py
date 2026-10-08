@@ -702,7 +702,7 @@ class SprintyCombat(CombatHandler):
             members: List[CombatMember] = await self.get_members()
 
             for member in members:
-                if name == await member.name():
+                if name == await member.name() and await self._is_targetable(member):
                     return member
             return None
         try:
@@ -719,7 +719,7 @@ class SprintyCombat(CombatHandler):
             members = await self.get_members()
 
             for member in members:
-                if name.lower() in (await member.name()).lower():
+                if name.lower() in (await member.name()).lower() and await self._is_targetable(member):
                     return member
             return None
         try:
@@ -929,6 +929,42 @@ class SprintyCombat(CombatHandler):
         return members
 
     @staticmethod
+    async def _is_alive(member: CombatMember) -> bool:
+        """False only for a member read at 0 health.
+
+        A killed enemy stays in the circle at 0 health for a while before the game removes
+        it, and `CombatMember.is_dead()` still reads False for it, so health is the test.
+        An unreadable member counts as alive: failing to read must not remove a target.
+        """
+        try:
+            return await member.health() > 0
+        except Exception:
+            return True
+
+    @staticmethod
+    async def _is_targetable(member: CombatMember) -> bool:
+        """False only when the game flags the participant untargetable.
+
+        The Heretical Academy dragon's heads are untargetable until their turn. A dead
+        member reads *targetable*, so this says nothing about death; pair it with
+        `_is_alive`. An unreadable member counts as targetable, as above.
+        """
+        try:
+            return not await (await member.get_participant()).untargetable()
+        except Exception:
+            return True
+
+    async def get_living_enemies(self) -> List[CombatMember]:
+        """Enemies with health left. Targetable or not: an untargetable enemy still counts
+        for `any/all/avg(enemies)`, whose question is about the fight, not about a cast."""
+        return [m for m in await self.get_enemies() if await self._is_alive(m)]
+
+    async def get_targetable_enemies(self) -> List[CombatMember]:
+        """Enemies a spell can be cast at: alive and not flagged untargetable. This is what
+        `enemy(n)` and `enemies` index, so `enemy(0)` is the first head you can actually hit."""
+        return [m for m in await self.get_living_enemies() if await self._is_targetable(m)]
+
+    @staticmethod
     def _at_index(members: List[CombatMember], n: int) -> Optional[CombatMember]:
         if n < 0:
             if len(members) < -n:
@@ -946,7 +982,7 @@ class SprintyCombat(CombatHandler):
         return self._at_index(await self.get_allies(), n)
 
     async def get_nth_enemy_or_none(self, n: int) -> Optional[CombatMember]:
-        return self._at_index(await self.get_enemies(), n)
+        return self._at_index(await self.get_targetable_enemies(), n)
 
     async def try_get_spell(self, spell: Spell, only_enchants=False, only_enchantable: bool = False, castable: bool = True, multi: bool = False, enchant_bonus: int = 0) -> Union[CombatCard, str, None, List]:
         if isinstance(spell, NamedSpell):
@@ -1018,7 +1054,8 @@ class SprintyCombat(CombatHandler):
             return None
 
         if ttype is TargetType.type_boss:
-            if boss := await self.get_boss_or_none():
+            boss = await self.get_boss_or_none()
+            if boss and await self._is_alive(boss) and await self._is_targetable(boss):
                 return boss
         elif ttype is TargetType.type_self:
             return await self.get_client_member()
@@ -1039,7 +1076,7 @@ class SprintyCombat(CombatHandler):
                 if ally := await self.get_nth_ally_or_none(data):
                     return ally
         elif ttype is TargetType.type_enemies:
-            enemies = await self.get_enemies()
+            enemies = await self.get_targetable_enemies()
             return enemies if enemies else False
         elif ttype is TargetType.type_allies:
             allies = [await self.get_client_member()] + await self.get_allies()
@@ -1096,7 +1133,7 @@ class SprintyCombat(CombatHandler):
         elif ttype is TargetType.type_ally:
             return await self.get_nth_ally_or_none(index if index is not None else 0)
         elif ttype is TargetType.type_enemies:
-            return await self.get_enemies()
+            return await self.get_living_enemies()
         elif ttype is TargetType.type_allies:
             return [await self.get_client_member()] + await self.get_allies()
         return None

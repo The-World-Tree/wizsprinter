@@ -31,6 +31,28 @@ have its own condition, or none at all.
 | `ally(-N)`  | Nth player from the end of your team |
 | `last`      | Spelled in place of an index: `ally(last)`, `enemy(last)` |
 
+### Which enemies count
+
+`enemy`, `enemy(N)` and `enemies` skip an enemy that is dead (0 health) or that
+the game has flagged untargetable, so `enemy(0)` is the first enemy a spell can
+actually be cast at. A killed enemy stays in the circle at 0 health for a while
+before the game removes it, which is why health is checked and not only the flag.
+
+In the Heretical Academy dragon fight only one head is targetable at a time, so
+`enemy(0)` is the current head in every phase, and `enemy(1)` is the next
+targetable one, if there is one.
+
+- `boss`, and a target given by name, are skipped the same way. A line like
+  `any<damage> @ boss | any<damage> @ enemy` falls through to its second
+  priority while the boss cannot be hit.
+- A condition on a single enemy (`?(enemy.health < 50%)`) reads the same enemy
+  the cast would hit.
+- `any(enemies)`, `all(enemies)` and `avg(enemies)` count every enemy with
+  health left, targetable or not: they describe the fight, not a cast. A dead
+  enemy is left out so it cannot drag an average down.
+- If the game's flags cannot be read for an enemy, it counts as alive and
+  targetable, as before.
+
 ### Counting from the end
 
 `last` is `-1`, so `ally(last)` and `ally(-1)` are the same target, as are
